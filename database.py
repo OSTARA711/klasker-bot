@@ -1401,8 +1401,114 @@ class KlaskerDatabase:
     # Runtime loading
     # ------------------------------------------------------------------
 
+    def load_frontier(self) -> list[FrontierItem]:
+        """Load the persisted discovery frontier."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM frontier
+                    ORDER BY
+                        priority ASC,
+                        depth ASC,
+                        discovered_at ASC
+                    """
+                )
+
+                rows = cursor.fetchall()
+
+        return [
+            self._frontier_from_row(row)
+            for row in rows
+        ]
+
+    def load_jobs(self) -> list[Job]:
+        """Load persisted jobs in queue order."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    ORDER BY
+                        priority ASC,
+                        created_at ASC
+                    """
+                )
+
+                rows = cursor.fetchall()
+
+        return [
+            self._job_from_row(row)
+            for row in rows
+        ]
+
+    def load_human_requests(self) -> list[HumanRequest]:
+        """Load persisted human requests."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM human_requests
+                    ORDER BY created_at ASC
+                    """
+                )
+
+                rows = cursor.fetchall()
+
+        requests: list[HumanRequest] = []
+
+        for row in rows:
+            websites = row["websites_discovered"]
+            capabilities = row[
+                "agent_capabilities_discovered"
+            ]
+
+            if isinstance(websites, str):
+                websites = json.loads(websites)
+
+            if isinstance(capabilities, str):
+                capabilities = json.loads(capabilities)
+
+            requests.append(
+                HumanRequest(
+                    request_id=row["request_id"],
+                    query=row["query_text"],
+                    created_at=(
+                        from_db_time(
+                            row["created_at"]
+                        )
+                        or utc_now()
+                    ),
+                    job_id=row["job_id"],
+                    status=JobStatus(
+                        row["status"]
+                    ),
+                    result_summary=row[
+                        "result_summary"
+                    ],
+                    websites_discovered=(
+                        websites or []
+                    ),
+                    agent_capabilities_discovered=(
+                        capabilities or []
+                    ),
+                )
+            )
+
+        return requests
+
     def load_runtime(self) -> BotRuntime:
-        """Load the persistent runtime needed to resume discovery."""
+        """Load the complete persistent runtime needed to resume."""
+
+        # Recover abandoned jobs before loading the runtime so that
+        # expired claims are represented as WAITING jobs.
+        self.recover_expired_jobs()
 
         runtime = BotRuntime()
 
@@ -1415,9 +1521,10 @@ class KlaskerDatabase:
         if checkpoint is not None:
             runtime.checkpoint = checkpoint
 
+        runtime.frontier = self.load_frontier()
+        runtime.jobs = self.load_jobs()
+        runtime.human_requests = self.load_human_requests()
         runtime.workers = self.load_workers()
-
-        self.recover_expired_jobs()
 
         return runtime
 
