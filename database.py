@@ -11,17 +11,32 @@ Environment variables:
     KLASKER_DB_PASSWORD
     KLASKER_DB_NAME       (default: klaskerbot)
     KLASKER_DB_SSL        (default: true)
+    KLASKER_DB_SSL_CA     (optional CA certificate path)
+
+If KLASKER_DB_SSL_CA is not supplied, the module automatically uses
+the local ISRG Root X1 certificate at:
+
+    ~/klasker-bot/certs/isrgrootx1.pem
+
+when that file exists.
+
+Command-line operations:
+    python3 database.py
+    python3 database.py --check
+    python3 database.py --init
 
 The module deliberately contains no crawler or network-discovery logic.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterator, Optional
 
 try:
@@ -51,6 +66,12 @@ from klaskerbot import (
 SCHEMA_VERSION = 1
 DEFAULT_PORT = 4000
 DEFAULT_DATABASE = "klaskerbot"
+
+DEFAULT_SSL_CA = (
+    Path(__file__).resolve().parent
+    / "certs"
+    / "isrgrootx1.pem"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +144,7 @@ class DatabaseConfig:
         password: Optional[str] = None,
         database: Optional[str] = None,
         ssl: Optional[bool] = None,
+        ssl_ca: Optional[str] = None,
     ) -> None:
         self.host = host or os.getenv(
             "KLASKER_DB_HOST",
@@ -171,6 +193,22 @@ class DatabaseConfig:
 
         self.ssl = ssl
 
+        configured_ca = (
+            ssl_ca
+            if ssl_ca is not None
+            else os.getenv(
+                "KLASKER_DB_SSL_CA",
+                "",
+            ).strip()
+        )
+
+        if configured_ca:
+            self.ssl_ca = configured_ca
+        elif DEFAULT_SSL_CA.is_file():
+            self.ssl_ca = str(DEFAULT_SSL_CA)
+        else:
+            self.ssl_ca = ""
+
     def validate(self) -> None:
         missing = []
 
@@ -182,6 +220,21 @@ class DatabaseConfig:
 
         if not self.password:
             missing.append("KLASKER_DB_PASSWORD")
+
+        if self.ssl and not self.ssl_ca:
+            missing.append(
+                "KLASKER_DB_SSL_CA "
+                "(or local certs/isrgrootx1.pem)"
+            )
+
+        if self.ssl and self.ssl_ca:
+            ca_path = Path(self.ssl_ca).expanduser()
+
+            if not ca_path.is_file():
+                raise RuntimeError(
+                    "TiDB TLS CA certificate was not found: "
+                    f"{ca_path}"
+                )
 
         if missing:
             raise RuntimeError(
@@ -314,6 +367,17 @@ SCHEMA_STATEMENTS = (
 )
 
 
+EXPECTED_TABLES = (
+    "schema_meta",
+    "bot_state",
+    "checkpoints",
+    "frontier",
+    "jobs",
+    "workers",
+    "human_requests",
+)
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -335,7 +399,15 @@ class KlaskerDatabase:
 
         if self.config.ssl:
             ssl_args = {
-                "ssl": {}
+                "ssl": {
+                    "ca": str(
+                        Path(
+                            self.config.ssl_ca
+                        ).expanduser()
+                    ),
+                },
+                "ssl_verify_cert": True,
+                "ssl_verify_identity": True,
             }
 
         return pymysql.connect(
@@ -416,6 +488,80 @@ class KlaskerDatabase:
                             WorkerStatus.OFFLINE.value,
                         ),
                     )
+
+    def check(self) -> dict[str, Any]:
+        """Verify the TiDB connection and KlaskerBot schema."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+
+                cursor.execute(
+                    "SELECT VERSION(), DATABASE()"
+                )
+
+                version, database = cursor.fetchone().values()
+
+                cursor.execute(
+                    """
+                    SELECT
+                        schema_version,
+                        updated_at
+                    FROM schema_meta
+                    ORDER BY schema_version DESC
+                    LIMIT 1
+                    """
+                )
+
+                schema_row = cursor.fetchone()
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS table_count
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name IN (
+                          'schema_meta',
+                          'bot_state',
+                          'checkpoints',
+                          'frontier',
+                          'jobs',
+                          'workers',
+                          'human_requests'
+                      )
+                    """,
+                    (self.config.database,),
+                )
+
+                table_row = cursor.fetchone()
+
+                cursor.execute(
+                    """
+                    SELECT
+                        worker_id,
+                        status
+                    FROM workers
+                    ORDER BY worker_id
+                    """
+                )
+
+                workers = cursor.fetchall()
+
+        table_count = int(table_row["table_count"])
+
+        return {
+            "version": version,
+            "database": database,
+            "schema_version": (
+                int(schema_row["schema_version"])
+                if schema_row is not None
+                else None
+            ),
+            "table_count": table_count,
+            "expected_table_count": len(
+                EXPECTED_TABLES
+            ),
+            "workers": workers,
+        }
 
     # ------------------------------------------------------------------
     # Runtime / checkpoint
@@ -1354,42 +1500,155 @@ class KlaskerDatabase:
 
 
 # ---------------------------------------------------------------------------
-# Minimal local self-test
+# Command-line interface
 # ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    config = DatabaseConfig()
+def print_configuration(
+    config: DatabaseConfig,
+) -> None:
+    """Print non-secret database configuration."""
 
-    print(
-        "KlaskerBot TiDB database module"
-    )
-
+    print("KlaskerBot TiDB database module")
     print(
         "Host configured:",
         "yes" if config.host else "no",
     )
-
     print(
         "Port:",
         config.port,
     )
-
     print(
         "Database:",
         config.database,
     )
-
     print(
         "TLS:",
         "enabled" if config.ssl else "disabled",
     )
+
+    if config.ssl:
+        print(
+            "TLS CA:",
+            config.ssl_ca or "not configured",
+        )
 
     print(
         "Schema version:",
         SCHEMA_VERSION,
     )
 
-    print(
-        "No database connection was opened by this self-test."
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the database command-line parser."""
+
+    parser = argparse.ArgumentParser(
+        description="KlaskerBot TiDB database management."
     )
+
+    group = parser.add_mutually_exclusive_group()
+
+    group.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialise the KlaskerBot database schema.",
+    )
+
+    group.add_argument(
+        "--check",
+        action="store_true",
+        help="Check the TiDB connection and schema.",
+    )
+
+    return parser
+
+
+def main() -> int:
+    """Run the database command-line interface."""
+
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    config = DatabaseConfig()
+    print_configuration(config)
+
+    if not args.init and not args.check:
+        print(
+            "No database connection was opened by this self-test."
+        )
+        return 0
+
+    database = KlaskerDatabase(config)
+
+    try:
+        if args.init:
+            print()
+            print("Initialising KlaskerBot database schema...")
+
+            database.initialise()
+
+            print("SUCCESS")
+            print(
+                "KlaskerBot database schema initialised."
+            )
+
+            return 0
+
+        result = database.check()
+
+        print()
+        print("Database connection: OK")
+        print(
+            f"TiDB version: {result['version']}"
+        )
+        print(
+            f"Database: {result['database']}"
+        )
+        print(
+            "Schema version:",
+            result["schema_version"],
+        )
+        print(
+            "Tables:",
+            f"{result['table_count']}/"
+            f"{result['expected_table_count']}",
+        )
+
+        if (
+            result["table_count"]
+            != result["expected_table_count"]
+        ):
+            print(
+                "WARNING: Expected schema tables are missing."
+            )
+            return 1
+
+        print("Workers:")
+
+        for worker in result["workers"]:
+            print(
+                f"  {worker['worker_id']}: "
+                f"{worker['status']}"
+            )
+
+        print("SUCCESS")
+        print(
+            "KlaskerBot database check completed."
+        )
+
+        return 0
+
+    except Exception as exc:
+        print()
+        print("ERROR")
+        print(str(exc))
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
